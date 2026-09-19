@@ -1,0 +1,273 @@
+# ESP32 relay controller: on/off by daily schedule, by hand, or both.
+#
+#   esphome run esphome/relay-scheduler.yaml
+#
+# Everything the schedule needs (times, days, enable) is exposed as an entity,
+# so it can be changed from Home Assistant or the built-in web server at
+# http://<device-ip>/ without re-flashing.
+
+substitutions:
+  device_name: relay-scheduler
+  friendly_name: Relay Scheduler
+
+  # Pin driving the relay module's IN terminal.
+  relay_pin: GPIO26
+  # Most cheap relay boards are active-LOW: set to "true" for those.
+  relay_inverted: "false"
+
+  # Optional momentary push button for local manual control (GPIO0 = the
+  # on-board BOOT button on most dev kits). Remove the binary_sensor below
+  # if you have no button wired.
+  button_pin: GPIO0
+
+  # https://github.com/esphome/esphome/blob/dev/esphome/components/time/__init__.py
+  timezone: Europe/London
+
+esphome:
+  name: ${device_name}
+  friendly_name: ${friendly_name}
+  on_boot:
+    # Wait for the clock, then put the relay where the schedule says it
+    # should be right now (covers reboots and power cuts mid-window).
+    priority: -100
+    then:
+      - script.execute: resync_schedule
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+
+logger:
+
+api:
+  encryption:
+    key: !secret api_encryption_key
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  # Falls back to its own AP if the network is unreachable, so the relay
+  # stays controllable by hand.
+  ap:
+    ssid: ${device_name}
+    password: !secret fallback_ap_password
+
+captive_portal:
+
+# Manual control (and the schedule settings) without Home Assistant.
+web_server:
+  port: 80
+  version: 3
+
+time:
+  - platform: sntp
+    id: esp_time
+    timezone: ${timezone}
+    on_time_sync:
+      then:
+        - script.execute: resync_schedule
+    on_time:
+      # Checked once a minute rather than with a fixed cron trigger, because
+      # the on/off times are runtime-editable numbers.
+      - seconds: 0
+        then:
+          - lambda: |-
+              if (!id(schedule_enabled).state) return;
+
+              auto now = id(esp_time).now();
+              if (!now.is_valid()) return;
+              // Day filter (ESPHome day_of_week: 1 = Sunday ... 7 = Saturday).
+              const bool weekday = now.day_of_week >= 2 && now.day_of_week <= 6;
+              const std::string days = id(schedule_days).current_option();
+              if (days == "Weekdays" && !weekday) return;
+              if (days == "Weekends" && weekday) return;
+
+              const int minute_of_day = now.hour * 60 + now.minute;
+              const int on_at  = (int) id(on_hour).state  * 60 + (int) id(on_minute).state;
+              const int off_at = (int) id(off_hour).state * 60 + (int) id(off_minute).state;
+              if (on_at == off_at) return;  // empty window: schedule does nothing
+
+              if (minute_of_day == on_at) {
+                ESP_LOGI("schedule", "Scheduled ON");
+                id(relay).turn_on();
+              } else if (minute_of_day == off_at) {
+                ESP_LOGI("schedule", "Scheduled OFF");
+                id(relay).turn_off();
+              }
+
+switch:
+  # The relay itself. Toggling this entity - from Home Assistant, the web
+  # server, or the push button below - is the manual control, and it works
+  # whether or not the schedule is enabled.
+  - platform: gpio
+    id: relay
+    name: Relay
+    pin:
+      number: ${relay_pin}
+      inverted: ${relay_inverted}
+    # Survives a reboot; the boot-time resync corrects it if a scheduled
+    # window was entered or left while the device was down.
+    restore_mode: RESTORE_DEFAULT_OFF
+
+  - platform: template
+    id: schedule_enabled
+    name: Schedule enabled
+    icon: mdi:calendar-clock
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    entity_category: config
+
+number:
+  - platform: template
+    id: on_hour
+    name: On hour
+    icon: mdi:clock-start
+    optimistic: true
+    restore_value: true
+    initial_value: 7
+    min_value: 0
+    max_value: 23
+    step: 1
+    mode: box
+    entity_category: config
+
+  - platform: template
+    id: on_minute
+    name: On minute
+    icon: mdi:clock-start
+    optimistic: true
+    restore_value: true
+    initial_value: 30
+    min_value: 0
+    max_value: 59
+    step: 1
+    mode: box
+    entity_category: config
+
+  - platform: template
+    id: off_hour
+    name: Off hour
+    icon: mdi:clock-end
+    optimistic: true
+    restore_value: true
+    initial_value: 22
+    min_value: 0
+    max_value: 23
+    step: 1
+    mode: box
+    entity_category: config
+
+  - platform: template
+    id: off_minute
+    name: Off minute
+    icon: mdi:clock-end
+    optimistic: true
+    restore_value: true
+    initial_value: 0
+    min_value: 0
+    max_value: 59
+    step: 1
+    mode: box
+    entity_category: config
+
+select:
+  - platform: template
+    id: schedule_days
+    name: Schedule days
+    icon: mdi:calendar-week
+    optimistic: true
+    restore_value: true
+    entity_category: config
+    options:
+      - Every day
+      - Weekdays
+      - Weekends
+    initial_option: Every day
+
+button:
+  # Re-apply the schedule to the relay right now - handy after changing the
+  # times, or to drop a manual override back to what the schedule wants.
+  - platform: template
+    name: Resync to schedule
+    icon: mdi:calendar-sync
+    entity_category: config
+    on_press:
+      - script.execute: resync_schedule
+
+binary_sensor:
+  # Local manual override: press toggles the relay.
+  - platform: gpio
+    name: Button
+    pin:
+      number: ${button_pin}
+      mode:
+        input: true
+        pullup: true
+      inverted: true
+    filters:
+      - delayed_on: 30ms
+    on_press:
+      - switch.toggle: relay
+
+text_sensor:
+  - platform: template
+    name: Next scheduled change
+    icon: mdi:calendar-arrow-right
+    entity_category: diagnostic
+    update_interval: 60s
+    lambda: |-
+      if (!id(schedule_enabled).state) return std::string("Schedule off");
+      char buf[16];
+      if (id(relay).state) {
+        snprintf(buf, sizeof(buf), "Off at %02d:%02d", (int) id(off_hour).state, (int) id(off_minute).state);
+      } else {
+        snprintf(buf, sizeof(buf), "On at %02d:%02d", (int) id(on_hour).state, (int) id(on_minute).state);
+      }
+      return std::string(buf);
+
+script:
+  # Set the relay to whatever the schedule says it should be at this moment.
+  # Overnight windows (on 22:00, off 06:00) are handled by wrapping midnight;
+  # the day filter is applied to the current day.
+  - id: resync_schedule
+    mode: restart
+    then:
+      - wait_until:
+          condition:
+            lambda: 'return id(esp_time).now().is_valid();'
+          timeout: 2min
+      - lambda: |-
+          if (!id(schedule_enabled).state) return;
+
+          auto now = id(esp_time).now();
+          if (!now.is_valid()) {
+            ESP_LOGW("schedule", "No valid time yet, leaving relay as-is");
+            return;
+          }
+          // Day filter (ESPHome day_of_week: 1 = Sunday ... 7 = Saturday).
+          const bool weekday = now.day_of_week >= 2 && now.day_of_week <= 6;
+          const std::string days = id(schedule_days).current_option();
+          if (days == "Weekdays" && !weekday) return;
+          if (days == "Weekends" && weekday) return;
+
+          const int minute_of_day = now.hour * 60 + now.minute;
+          const int on_at  = (int) id(on_hour).state  * 60 + (int) id(on_minute).state;
+          const int off_at = (int) id(off_hour).state * 60 + (int) id(off_minute).state;
+          if (on_at == off_at) return;  // empty window: schedule does nothing
+
+          const bool should_be_on = on_at < off_at
+              ? (minute_of_day >= on_at && minute_of_day < off_at)
+              : (minute_of_day >= on_at || minute_of_day < off_at);
+
+          ESP_LOGI("schedule", "Resync at %02d:%02d -> relay %s",
+                   now.hour, now.minute, should_be_on ? "ON" : "OFF");
+          if (should_be_on) {
+            id(relay).turn_on();
+          } else {
+            id(relay).turn_off();
+          }
